@@ -1,0 +1,10 @@
+{
+  "name": "bed-viewer",
+  "version": "1.0.0",
+  "description": "Interactive BED file viewer with column detection, color-coded fields, sorting, filtering, and region statistics",
+  "extensions": [
+    "bed"
+  ],
+  "entry": "index.js",
+  "style": "style.css"
+}
