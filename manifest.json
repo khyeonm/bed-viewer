@@ -1,6 +1,6 @@
 {
   "name": "bed-viewer",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Interactive BED file viewer with column detection, color-coded fields, sorting, filtering, and region statistics",
   "extensions": [
     "bed"
