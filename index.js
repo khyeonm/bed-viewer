@@ -129,10 +129,9 @@
 
     var stats = computeStats(filteredRecords);
     var chroms = getChromList(allRecords);
-    var totalPages = Math.max(1, Math.ceil(filteredRecords.length / PAGE_SIZE));
-    if (currentPage >= totalPages) currentPage = totalPages - 1;
+    var totalPages = Math.max(1, Math.ceil(_totalRecords / PAGE_SIZE));
     var startIdx = currentPage * PAGE_SIZE;
-    var pageRecs = filteredRecords.slice(startIdx, startIdx + PAGE_SIZE);
+    var pageRecs = filteredRecords;
 
     var headers = BED_HEADERS.slice(0, ncols);
     // Add computed Length column
@@ -142,7 +141,7 @@
 
     // Summary
     html += '<div class="bed-summary">';
-    html += '<span class="stat"><b>' + formatNum(filteredRecords.length) + '</b> regions</span>';
+    html += '<span class="stat"><b>' + formatNum(_totalRecords) + '</b> regions</span>';
     html += '<span class="stat"><b>' + chroms.length + '</b> chromosomes</span>';
     html += '<span class="stat">BED' + ncols + ' format</span>';
     if (showLen) {
@@ -243,15 +242,15 @@
       });
     }
 
-    // Pagination buttons
+    // Pagination buttons — server-side
     var pageBtns = target.querySelectorAll('.bed-pagination button');
     for (var bi = 0; bi < pageBtns.length; bi++) {
       pageBtns[bi].addEventListener('click', function() {
         var pg = this.getAttribute('data-page');
-        if (pg === 'prev') { if (currentPage > 0) currentPage--; }
-        else if (pg === 'next') { var tp = Math.ceil(filteredRecords.length / PAGE_SIZE); if (currentPage < tp - 1) currentPage++; }
-        else { currentPage = parseInt(pg, 10); }
-        render();
+        var tp = Math.ceil(_totalRecords / PAGE_SIZE);
+        if (pg === 'prev') { if (currentPage > 0) _loadPage(currentPage - 1); }
+        else if (pg === 'next') { if (currentPage < tp - 1) _loadPage(currentPage + 1); }
+        else { _loadPage(parseInt(pg, 10)); }
       });
     }
   }
@@ -330,33 +329,53 @@
   var TRACK_TYPE = 'annotation';
   var TRACK_FORMAT = 'bed';
 
+  var _totalRecords = 0;
+  var _currentFilename = '';
+
+  function _fetchPage(filename, page) {
+    return fetch('/data/' + encodeURIComponent(filename) + '?page=' + page + '&page_size=' + PAGE_SIZE)
+      .then(function(resp) { return resp.json(); });
+  }
+
+  function _loadPage(page) {
+    var target = (rootEl && rootEl.querySelector('#__plugin_content__')) || rootEl;
+    if (!target) return;
+    target.innerHTML = '<div class="ap-loading">Loading...</div>';
+
+    _fetchPage(_currentFilename, page).then(function(data) {
+      if (data.error) {
+        target.innerHTML = '<p style="color:red;padding:16px;">Error: ' + data.error + '</p>';
+        return;
+      }
+      _totalRecords = data.total || _totalRecords;
+      currentPage = page;
+      var text = '';
+      if (data.rows) {
+        for (var i = 0; i < data.rows.length; i++) {
+          var row = data.rows[i];
+          text += (Array.isArray(row) ? row.join('\t') : row) + '\n';
+        }
+      }
+      allRecords = parse(text);
+      ncols = 0;
+      for (var i = 0; i < allRecords.length; i++) {
+        if (allRecords[i].length > ncols) ncols = allRecords[i].length;
+      }
+      ncols = Math.min(ncols, 12);
+      filteredRecords = allRecords.slice();
+      sortCol = -1; sortAsc = true; filterText = ''; filterChrom = '';
+      render();
+    }).catch(function(err) {
+      target.innerHTML = '<p style="color:red;padding:16px;">Error: ' + err.message + '</p>';
+    });
+  }
+
   function _renderData(container, fileUrl, filename) {
     container.innerHTML = '<div class="ap-loading">Loading...</div>';
-
-    // Reset state
-    allRecords = [];
-    filteredRecords = [];
-    sortCol = -1;
-    sortAsc = true;
-    currentPage = 0;
-    filterText = '';
-    filterChrom = '';
-
-    fetch(fileUrl)
-      .then(function(resp) { return resp.text(); })
-      .then(function(data) {
-        allRecords = parse(data);
-        ncols = 0;
-        for (var i = 0; i < allRecords.length; i++) {
-          if (allRecords[i].length > ncols) ncols = allRecords[i].length;
-        }
-        ncols = Math.min(ncols, 12); // BED12 max
-        filteredRecords = allRecords.slice();
-        render();
-      })
-      .catch(function(err) {
-        container.innerHTML = '<p style="color:red;padding:16px;">Error loading BED file: ' + err.message + '</p>';
-      });
+    allRecords = []; filteredRecords = []; sortCol = -1; sortAsc = true;
+    currentPage = 0; filterText = ''; filterChrom = '';
+    _currentFilename = filename;
+    _loadPage(0);
   }
 
   function _showView(container, fileUrl, filename) {
