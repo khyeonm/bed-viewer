@@ -307,7 +307,7 @@
   }
 
   function _renderIgv(container, fileUrl, filename, trackType, trackFormat) {
-    container.innerHTML = '<div id="__igv_div__">Loading IGV.js...</div>';
+    container.innerHTML = '<div id="__igv_div__" class="ap-loading">Loading...</div>';
     _loadIgvJs().then(function() {
       var div = document.getElementById('__igv_div__');
       if (!div) return;
@@ -331,7 +331,7 @@
   var TRACK_FORMAT = 'bed';
 
   function _renderData(container, fileUrl, filename) {
-    container.innerHTML = '<div class="bed-loading">Loading ' + filename + '...</div>';
+    container.innerHTML = '<div class="ap-loading">Loading...</div>';
 
     // Reset state
     allRecords = [];
