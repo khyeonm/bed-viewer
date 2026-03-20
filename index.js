@@ -387,6 +387,7 @@
   window.AutoPipePlugin = {
     render: function(container, fileUrl, filename) {
       rootEl = container;
+      rootEl.innerHTML = '<div class="ap-loading">Loading...</div>';
       _savedFileUrl = fileUrl;
       _savedFilename = filename;
       _igvMode = 'data';
