@@ -273,6 +273,72 @@
   var _igvRef = null;
   var _igvMode = 'data';
   var _selectedGenome = null;
+  var _igvBrowser = null;
+
+  // Minimum width of the region IGV opens at, so a single narrow feature still
+  // lands in a readable window rather than a few pixels wide.
+  var IGV_MIN_WINDOW = 10000;
+
+  function _escapeHtml(str) {
+    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  // The reference arrives either as a genome ID, a bare filename, or a full
+  // path (show_results passes whatever the caller supplied). /file/ is keyed by
+  // filename alone, so strip any directory part.
+  function _refUrl(ref) {
+    var base = String(ref).replace(/\\/g, '/').split('/').pop();
+    return '/file/' + encodeURIComponent(base);
+  }
+
+  function _disposeIgvBrowser() {
+    if (_igvBrowser) {
+      // The host never calls destroy(), and igv.js keeps every browser it
+      // creates in a module-level list. Without this, each tab switch leaks a
+      // browser plus its listeners and caches.
+      try { igv.removeBrowser(_igvBrowser); } catch (e) { /* already detached */ }
+      _igvBrowser = null;
+    }
+  }
+
+  // A 1-byte ranged GET is used rather than HEAD so this works on any server
+  // that serves /file/.
+  function _probeUrl(url) {
+    return fetch(url, { headers: { Range: 'bytes=0-0' } })
+      .then(function(r) { return r.ok ? url : null; })
+      .catch(function() { return null; });
+  }
+
+  function _findIndex(fileUrl, exts) {
+    var candidates = [];
+    for (var i = 0; i < exts.length; i++) {
+      candidates.push(fileUrl + '.' + exts[i]);
+      candidates.push(fileUrl.replace(/\.[^.\/]+$/, '.' + exts[i]));
+    }
+    return candidates.reduce(function(chain, url) {
+      return chain.then(function(found) { return found || _probeUrl(url); });
+    }, Promise.resolve(null));
+  }
+
+  // Without an explicit locus igv.js opens at the whole first chromosome, or
+  // the whole genome when the reference has several contigs — features are
+  // then sub-pixel. Anchor the initial view on the first record instead.
+  function _resolveLocus(filename) {
+    return fetch('/data/' + encodeURIComponent(filename) + '?page=0&page_size=1')
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        var rec = d && d.rows && d.rows[0];
+        if (!rec) return null;
+        var chrom = rec[0];
+        var start = parseInt(rec[1], 10);   // BED start is 0-based
+        var end = parseInt(rec[2], 10);
+        if (!chrom || isNaN(start)) return null;
+        if (isNaN(end) || end <= start) end = start + 1;
+        var pad = Math.max(0, Math.floor((IGV_MIN_WINDOW - (end - start)) / 2));
+        return chrom + ':' + Math.max(1, start + 1 - pad) + '-' + (end + pad);
+      })
+      .catch(function() { return null; });
+  }
 
   function _fetchReference() {
     return fetch('/api/reference').then(function(r) { return r.json(); })
@@ -293,9 +359,10 @@
 
   function _buildGenomeDropdown() {
     var current = _selectedGenome || _igvRef || '';
+    var refLabel = _igvRef ? String(_igvRef).replace(/\\/g, '/').split('/').pop() : '';
     var html = '<span style="font-size:12px;color:#888;font-weight:500;margin-right:4px">Reference:</span>';
     html += '<select id="__igv_genome_select__" style="font-size:12px;padding:4px 8px;max-width:220px;border:1px solid #ddd;border-radius:4px">';
-    html += '<option value="' + (_igvRef || '') + '"' + (current === _igvRef ? ' selected' : '') + '>' + (_igvRef || 'none') + '</option>';
+    html += '<option value="' + _escapeHtml(_igvRef || '') + '"' + (current === _igvRef ? ' selected' : '') + '>' + _escapeHtml(refLabel || 'none') + '</option>';
     KNOWN_GENOMES.forEach(function(g) {
       if (g.id !== _igvRef) {
         html += '<option value="' + g.id + '"' + (current === g.id ? ' selected' : '') + '>' + g.label + '</option>';
@@ -306,23 +373,54 @@
   }
 
   function _renderIgv(container, fileUrl, filename, trackType, trackFormat) {
-    container.innerHTML = '<div id="__igv_div__" class="ap-loading">Loading...</div>';
-    _loadIgvJs().then(function() {
-      var div = document.getElementById('__igv_div__');
-      if (!div) return;
-      div.innerHTML = '';
-      var activeRef = _selectedGenome || _igvRef;
+    _disposeIgvBrowser();
+    container.innerHTML = '';
+    var div = document.createElement('div');
+    div.className = 'ap-loading';
+    div.textContent = 'Loading...';
+    container.appendChild(div);
+
+    var activeRef = _selectedGenome || _igvRef;
+    var knownIds = KNOWN_GENOMES.map(function(g) { return g.id; });
+    var isKnownGenome = knownIds.indexOf(activeRef) >= 0;
+
+    return Promise.all([
+      _loadIgvJs(),
+      _resolveLocus(filename),
+      isKnownGenome ? Promise.resolve(null) : _findIndex(_refUrl(activeRef), ['fai'])
+    ]).then(function(results) {
+      var locus = results[1], refIndex = results[2];
+      // The user may have switched tabs while the probes were in flight.
+      if (!div.isConnected) return;
+      div.textContent = '';
+      div.className = '';
+
       var opts = {};
-      var knownIds = KNOWN_GENOMES.map(function(g) { return g.id; });
-      if (knownIds.indexOf(activeRef) >= 0) {
+      if (isKnownGenome) {
         opts.genome = activeRef;
       } else {
-        opts.reference = { fastaURL: '/file/' + encodeURIComponent(activeRef), indexed: false };
+        opts.reference = { fastaURL: _refUrl(activeRef) };
+        if (refIndex) {
+          // Indexed means igv.js range-reads the FASTA instead of pulling the
+          // whole file into memory — the difference between a few KB and the
+          // entire reference.
+          opts.reference.indexURL = refIndex;
+          opts.reference.indexed = true;
+        } else {
+          opts.reference.indexed = false;
+        }
       }
+      if (locus) opts.locus = locus;
       opts.tracks = [{ type: trackType, format: trackFormat, url: fileUrl, name: filename }];
-      igv.createBrowser(div, opts);
+
+      // Returned, not fire-and-forget: a rejected createBrowser used to become
+      // an unhandled rejection and leave a blank pane with no explanation.
+      return igv.createBrowser(div, opts).then(function(browser) {
+        _igvBrowser = browser;
+      });
     }).catch(function(e) {
-      container.innerHTML = '<div style="color:red;padding:16px;">IGV Error: ' + e.message + '</div>';
+      container.innerHTML = '<div style="color:red;padding:16px;">IGV Error: ' +
+        _escapeHtml(e && e.message ? e.message : String(e)) + '</div>';
     });
   }
 
@@ -379,6 +477,9 @@
   }
 
   function _showView(container, fileUrl, filename) {
+    // Every path through here replaces container.innerHTML, detaching any live
+    // IGV browser — drop it before the DOM goes away.
+    _disposeIgvBrowser();
     if (_igvRef) {
       var tabsHtml = '<div style="display:flex;gap:4px;margin-bottom:12px">';
       tabsHtml += '<button id="__tab_data__" style="padding:6px 16px;border:1px solid #ddd;border-radius:4px;cursor:pointer;font-size:13px;' + (_igvMode === 'data' ? 'background:#007bff;color:white;border-color:#007bff' : 'background:#f8f8f8') + '">Data</button>';
@@ -405,6 +506,9 @@
 
   window.AutoPipePlugin = {
     render: function(container, fileUrl, filename) {
+      // The host caches the plugin instance and only ever calls render(), so
+      // this is the one reliable teardown point between files.
+      _disposeIgvBrowser();
       rootEl = container;
       rootEl.innerHTML = '<div class="ap-loading">Loading...</div>';
       _savedFileUrl = fileUrl;
@@ -418,6 +522,7 @@
     },
 
     destroy: function() {
+      _disposeIgvBrowser();
       allRecords = [];
       filteredRecords = [];
       rootEl = null;
