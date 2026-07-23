@@ -324,8 +324,9 @@
   // the whole genome when the reference has several contigs — features are
   // then sub-pixel. Anchor the initial view on the first record instead.
   function _resolveLocus(filename) {
-    return fetch('/data/' + encodeURIComponent(filename) + '?page=0&page_size=1')
-      .then(function(r) { return r.json(); })
+    // Reuse _fetchPage so a .gz file's first record comes from the same
+    // browser-side stream as its table, not the server /data/ endpoint.
+    return Promise.resolve(_fetchPage(filename, 0))
       .then(function(d) {
         var rec = d && d.rows && d.rows[0];
         if (!rec) return null;
@@ -396,9 +397,10 @@
     return Promise.all([
       _loadIgvJs(),
       _resolveLocus(filename),
-      isKnownGenome ? Promise.resolve(null) : _findIndex(_refUrl(activeRef), ['fai'])
+      isKnownGenome ? Promise.resolve(null) : _findIndex(_refUrl(activeRef), ['fai']),
+      /\.gz$/i.test(fileUrl) ? _findIndex(fileUrl, ['tbi', 'csi']) : Promise.resolve(null)
     ]).then(function(results) {
-      var locus = results[1], refIndex = results[2];
+      var locus = results[1], refIndex = results[2], trackIndex = results[3];
       // The user may have switched tabs while the probes were in flight.
       if (!div.isConnected) return;
       div.textContent = '';
@@ -420,7 +422,9 @@
         }
       }
       if (locus) opts.locus = locus;
-      opts.tracks = [{ type: trackType, format: trackFormat, url: fileUrl, name: filename }];
+      var track = { type: trackType, format: trackFormat, url: fileUrl, name: filename };
+      if (trackIndex) track.indexURL = trackIndex;
+      opts.tracks = [track];
 
       // Returned, not fire-and-forget: a rejected createBrowser used to become
       // an unhandled rejection and leave a blank pane with no explanation.
@@ -439,9 +443,88 @@
   var _totalRecords = 0;
   var _currentFilename = '';
 
+  function _isGz(name) { return /\.gz$/i.test(name); }
+
+  function _ensureBgzf() {
+    if (window.AutoPipeBgzf) return Promise.resolve();
+    return new Promise(function(resolve) {
+      var el = document.createElement('script');
+      el.src = '/plugin/bed-viewer/bgzf.js';
+      el.onload = function() { resolve(); };
+      el.onerror = function() { resolve(); };
+      document.head.appendChild(el);
+    });
+  }
+
+  var _gzCursor = null;
+
+  // A .bed.gz is bgzipped text; decode it in the browser over /file/ Range
+  // requests so no server tool is needed and large files stream a page at a
+  // time. Plain .bed keeps using /data/ (grep/sed on the server).
   function _fetchPage(filename, page) {
+    if (_isGz(filename)) {
+      return _ensureBgzf().then(function() {
+        if (window.AutoPipeBgzf && window.AutoPipeBgzf.available) {
+          return _fetchPageGz(filename, page);
+        }
+        return _fetchPageServer(filename, page);
+      });
+    }
+    return _fetchPageServer(filename, page);
+  }
+
+  function _fetchPageServer(filename, page) {
     return fetch('/data/' + encodeURIComponent(filename) + '?page=' + page + '&page_size=' + PAGE_SIZE)
       .then(function(resp) { return resp.json(); });
+  }
+
+  function _isComment(l) { return l.charAt(0) === '#' || l.indexOf('track') === 0 || l.indexOf('browser') === 0; }
+
+  function _fetchPageGz(filename, page) {
+    var fileUrl = _savedFileUrl || ('/file/' + encodeURIComponent(filename));
+    var reuse = _gzCursor && _gzCursor.name === filename && _gzCursor.page === page - 1;
+    var start;
+    if (reuse) {
+      start = Promise.resolve(_gzCursor);
+    } else {
+      var rd = window.AutoPipeBgzf.lineReader(fileUrl);
+      _gzCursor = { name: filename, page: -1, rd: rd };
+      start = _skipRows(_gzCursor, page * PAGE_SIZE).then(function() { return _gzCursor; });
+    }
+    return start.then(function(cur) {
+      return _takeRows(cur, PAGE_SIZE).then(function(rows) {
+        cur.page = page;
+        return {
+          rows: rows,
+          total: page * PAGE_SIZE + rows.length,
+          page: page,
+          page_size: PAGE_SIZE
+        };
+      });
+    });
+  }
+
+  // Comment/track lines are skipped so they never count as records.
+  function _takeRows(cur, n) {
+    var rows = [];
+    function pull() {
+      if (rows.length >= n) return Promise.resolve(rows);
+      return cur.rd.readLines(n - rows.length + 4).then(function(lines) {
+        if (!lines.length) return rows;
+        for (var i = 0; i < lines.length && rows.length < n; i++) {
+          var l = lines[i];
+          if (l.length && !_isComment(l)) rows.push(l.split('\t'));
+        }
+        if (cur.rd.state.eof && rows.length < n) return rows;
+        return pull();
+      });
+    }
+    return pull();
+  }
+
+  function _skipRows(cur, n) {
+    if (n <= 0) return Promise.resolve();
+    return _takeRows(cur, n).then(function() {});
   }
 
   function _loadPage(page) {
@@ -522,6 +605,7 @@
       rootEl.innerHTML = '<div class="ap-loading">Loading...</div>';
       _savedFileUrl = fileUrl;
       _savedFilename = filename;
+      _gzCursor = null;
       _igvMode = 'data';
       _selectedGenome = null;
 
